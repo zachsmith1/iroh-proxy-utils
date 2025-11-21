@@ -353,9 +353,9 @@ pub enum Request {
 
 #[derive(Debug)]
 pub struct ProxyConnectRequest {
-    host: String,
-    port: u16,
-    endpoint_addr: Option<EndpointAddr>,
+    pub host: String,
+    pub port: u16,
+    pub endpoint_addr: Option<EndpointAddr>,
 }
 
 impl ProxyConnectRequest {
@@ -370,9 +370,9 @@ impl ProxyConnectRequest {
 
 #[derive(Debug)]
 pub struct ProxyHttpRequest {
-    method: String,
-    path: String,
-    endpoint_addr: Option<EndpointAddr>,
+    pub method: String,
+    pub path: String,
+    pub endpoint_addr: Option<EndpointAddr>,
 }
 
 impl Request {
