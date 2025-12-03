@@ -1,4 +1,4 @@
-use n0_snafu::{Result, ResultExt};
+use n0_error::{Result, StdResultExt};
 use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -37,8 +37,8 @@ pub(crate) async fn forward_bidi(
         token3.cancel();
         io::Result::Ok(())
     });
-    forward_to_stdout.await.e()?.e()?;
-    forward_from_stdin.await.e()?.e()?;
+    forward_to_stdout.await.anyerr()?.anyerr()?;
+    forward_from_stdin.await.anyerr()?.anyerr()?;
     Ok(())
 }
 

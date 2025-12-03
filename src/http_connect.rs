@@ -1,13 +1,13 @@
-use httparse::{self, Header};
-use iroh::endpoint::{Connecting, Connection};
-use iroh::{Endpoint, EndpointAddr, PublicKey};
-use n0_snafu::{Result, ResultExt};
-use quinn::{RecvStream, SendStream};
-use snafu::{FromString, whatever};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use httparse::{self, Header};
+use iroh::endpoint::{Accepting, Connection};
+use iroh::{Endpoint, EndpointAddr, PublicKey};
+use n0_error::{Result, StdResultExt, anyerr, ensure_any};
+use quinn::{RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -63,7 +63,11 @@ impl HttpConnectEntranceHandle {
             Ok(tcp_listener) => tcp_listener,
             Err(cause) => {
                 tracing::error!("error binding tcp socket to {:?}: {}", listen, cause);
-                whatever!("error binding tcp socket to {:?}: {}", listen, cause);
+                return Err(anyerr!(
+                    "error binding tcp socket to {:?}: {}",
+                    listen,
+                    cause
+                ));
             }
         };
         tracing::info!("tcp listening on {:?}", listen);
@@ -86,10 +90,10 @@ impl HttpConnectEntranceHandle {
                 let endpoint = endpoint_2.clone();
                 tokio::spawn(async move {
                     let res = async {
-                        let (client_stream, client_addr) = next.context("accepting tcp connection")?;
+                        let (client_stream, client_addr) = next.std_context("accepting tcp connection")?;
 
                         let (tcp_stream, req, raw_handshake) =
-                            handle_connect_handshake(client_stream).await.context("handling CONNECT handshake")?;
+                            handle_connect_handshake(client_stream).await.std_context("handling CONNECT handshake")?;
                         tracing::debug!(req = ?req, client_addr = ?client_addr, "HTTP CONNECT request has valid headers");
 
                         let addr = match req {
@@ -104,26 +108,26 @@ impl HttpConnectEntranceHandle {
                                 let connection = endpoint
                                     .connect(addr, IROH_HTTP_CONNECT_ALPN)
                                     .await
-                                    .context(format!("error connecting to {remote_ep_id}"))?;
+                                    .std_context(format!("error connecting to {remote_ep_id}"))?;
                                 let (mut endpoint_send, mut endpoint_recv) = connection
                                     .open_bi()
                                     .await
-                                    .context(format!("error opening bidi stream to {remote_ep_id}"))?;
+                                    .std_context(format!("error opening bidi stream to {remote_ep_id}"))?;
 
-                                endpoint_send.write_all(&raw_handshake).await.e()?;
+                                endpoint_send.write_all(&raw_handshake).await.anyerr()?;
 
-                                let data = endpoint_recv.read_to_end(1000).await.e()?;
+                                let data = endpoint_recv.read_to_end(1000).await.anyerr()?;
                                 tcp_send.write_all(&data).await.map_err(|_| {
-                                    n0_snafu::Error::without_source("sending connect success response".to_string())
+                                    n0_error::AnyError::from_string("sending connect success response".to_string())
                                 })?;
 
                                 let (mut endpoint_send_2, endpoint_recv_2) =
-                                    connection.open_bi().await.context("opening bidi stream")?;
+                                    connection.open_bi().await.std_context("opening bidi stream")?;
                                 endpoint_send_2
                                     .write(STREAM_OPEN_HANDSHAKE)
                                     .await
                                     .map_err(|_| {
-                                        n0_snafu::Error::without_source(
+                                        n0_error::AnyError::from_string(
                                             "sending connect handshake response".to_string(),
                                         )
                                     })?;
@@ -157,7 +161,7 @@ impl HttpConnectEntranceHandle {
                                 // tracing::debug!(from_client, from_server, "Tunnel closed");
                             }
                         }
-                        Ok::<(), n0_snafu::Error>(())
+                        Ok::<(), n0_error::AnyError>(())
                     }
                     .await;
 
@@ -220,12 +224,12 @@ impl HttpConnectListenerHandle {
                 let Some(incoming) = incoming else {
                     break;
                 };
-                let Ok(connecting) = incoming.accept() else {
+                let Ok(accepting) = incoming.accept() else {
                     break;
                 };
                 let auth = auth.clone();
                 tokio::spawn(async move {
-                    if let Err(cause) = Self::handle_endpoint_accept(connecting, auth).await {
+                    if let Err(cause) = Self::handle_endpoint_accept(accepting, auth).await {
                         tracing::warn!("error handling connection: {}", cause);
                     }
                 });
@@ -241,22 +245,22 @@ impl HttpConnectListenerHandle {
 
     // handle a new incoming connection on the endpoint
     async fn handle_endpoint_accept(
-        connecting: Connecting,
+        accepting: Accepting,
         auth: Option<Arc<Box<dyn AuthHandler>>>,
     ) -> Result<()> {
-        let connection = connecting.await.context("error accepting connection")?;
-        let remote_node_id = &connection.remote_id()?;
-        tracing::info!(remote_node_id = %remote_node_id.fmt_short(), "got connection");
+        let connection = accepting.await.std_context("error accepting connection")?;
+        let remote_endpoint_id = &connection.remote_id();
+        tracing::info!(remote_node_id = %remote_endpoint_id.fmt_short(), "got connection");
 
         // accept a bidi stream to do the HTTP CONNECT handshake
         let (s, mut r) = connection
             .accept_bi()
             .await
-            .context("error accepting stream")?;
-        tracing::debug!("accepted bidi stream from {}", remote_node_id);
+            .std_context("error accepting stream")?;
+        tracing::debug!("accepted bidi stream from {}", remote_endpoint_id);
 
         let mut buffer = vec![0u8; CONNECT_HANDSHAKE_MAX_LENGTH];
-        r.read(&mut buffer).await.context("reading handshake")?;
+        r.read(&mut buffer).await.std_context("reading handshake")?;
         let req = Request::parse(&buffer)?;
         tracing::warn!(req = ?req, "read handshake");
 
@@ -265,7 +269,7 @@ impl HttpConnectListenerHandle {
             handler
                 .authorize(&req)
                 .await
-                .map_err(|_| n0_snafu::Error::without_source("unauthorized".to_string()))?;
+                .map_err(|_| n0_error::AnyError::from_string("unauthorized".to_string()))?;
         }
 
         match req {
@@ -278,11 +282,11 @@ impl HttpConnectListenerHandle {
         let (endpoint_send, mut endpoint_recv) = connection
             .accept_bi()
             .await
-            .context("error accepting stream 2")?;
+            .std_context("error accepting stream 2")?;
 
         let mut buf = [0u8; STREAM_OPEN_HANDSHAKE.len()];
-        endpoint_recv.read_exact(&mut buf).await.e()?;
-        snafu::ensure_whatever!(buf == STREAM_OPEN_HANDSHAKE, "invalid handshake");
+        endpoint_recv.read_exact(&mut buf).await.anyerr()?;
+        ensure_any!(buf == STREAM_OPEN_HANDSHAKE, "invalid handshake");
         Ok((endpoint_send, endpoint_recv))
     }
 
@@ -294,9 +298,9 @@ impl HttpConnectListenerHandle {
         s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .map_err(|_| {
-                n0_snafu::Error::without_source("sending connect success response".to_string())
+                n0_error::AnyError::from_string("sending connect success response".to_string())
             })?;
-        s.finish().context("finishing stream")?;
+        s.finish().std_context("finishing stream")?;
 
         let (proxied_send, proxied_recv) = Self::accept_data_stream(&connection).await?;
 
@@ -307,8 +311,8 @@ impl HttpConnectListenerHandle {
         tracing::debug!("forwarding TCP stream data to bidi QUIC stream");
         forward_bidi(tcp_recv, tcp_send, proxied_recv.into(), proxied_send.into()).await?;
 
-        let remote_node_id = &connection.remote_id()?;
-        tracing::info!(remote_node_id = %remote_node_id.fmt_short(), "connection completed");
+        let remote_endpoint_id = &connection.remote_id();
+        tracing::info!(remote_node_id = %remote_endpoint_id.fmt_short(), "connection completed");
         Ok(())
     }
 
@@ -318,19 +322,19 @@ impl HttpConnectListenerHandle {
         req: ProxyHttpRequest,
     ) -> Result<()> {
         // close the initial stream, we don't need to ACK.
-        s.finish().e()?;
+        s.finish().anyerr()?;
 
         let (mut proxied_send, _) = Self::accept_data_stream(&connection).await?;
 
         let client = reqwest::Client::new();
         let method = reqwest::Method::from_str(&req.method).map_err(|_| {
-            n0_snafu::Error::without_source("invalid HTTP request method".to_string())
+            n0_error::AnyError::from_string("invalid HTTP request method".to_string())
         })?;
-        let res = client.request(method, req.path).send().await.e()?;
+        let res = client.request(method, req.path).send().await.anyerr()?;
         // TODO - pipe the response instead of buffering
-        let body = res.bytes().await.e()?;
-        proxied_send.write_all(&body).await.e()?;
-        proxied_send.finish().e()?;
+        let body = res.bytes().await.anyerr()?;
+        proxied_send.write_all(&body).await.anyerr()?;
+        proxied_send.finish().anyerr()?;
         Ok(())
     }
 
@@ -364,7 +368,7 @@ impl ProxyConnectRequest {
         tracing::debug!(host = self.host, addr, "opening connect request TCP stream");
         TcpStream::connect(addr)
             .await
-            .context("opening connect request TCP stream")
+            .std_context("opening connect request TCP stream")
     }
 }
 
@@ -383,10 +387,13 @@ impl Request {
         }; 32];
         let mut req = httparse::Request::new(&mut headers);
 
-        match req.parse(buffer).context("Failed to parse HTTP request")? {
+        match req
+            .parse(buffer)
+            .std_context("Failed to parse HTTP request")?
+        {
             httparse::Status::Complete(_bytes_parsed) => {
                 let method = req.method.ok_or_else(|| {
-                    n0_snafu::Error::without_source("Missing method in CONNECT request".to_string())
+                    n0_error::AnyError::from_string("Missing method in CONNECT request".to_string())
                 })?;
 
                 let endpoint_addr = req
@@ -409,7 +416,7 @@ impl Request {
                     "CONNECT" => Self::from_connect_request(req, endpoint_addr),
                     "GET" | "PUT" | "POST" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE" | "PATCH" => {
                         let path = req.path.ok_or_else(|| {
-                            n0_snafu::Error::without_source(
+                            n0_error::AnyError::from_string(
                                 "missing path value for HTTP request".to_string(),
                             )
                         })?;
@@ -419,13 +426,13 @@ impl Request {
                             endpoint_addr,
                         }))
                     }
-                    _ => Err(n0_snafu::Error::without_source(format!(
+                    _ => Err(n0_error::AnyError::from_string(format!(
                         "Invalid request method: {}",
                         method
                     ))),
                 }
             }
-            httparse::Status::Partial => Err(n0_snafu::Error::without_source(
+            httparse::Status::Partial => Err(n0_error::AnyError::from_string(
                 "Incomplete HTTP request".to_string(),
             )),
         }
@@ -437,12 +444,12 @@ impl Request {
     ) -> Result<Self> {
         // Parse the path which should be "host:port"
         let path = req.path.ok_or_else(|| {
-            n0_snafu::Error::without_source("Missing path in CONNECT request".to_string())
+            n0_error::AnyError::from_string("Missing path in CONNECT request".to_string())
         })?;
 
         // Split into host and port
         let (host, port_str) = path.rsplit_once(':').ok_or_else(|| {
-            n0_snafu::Error::without_source("Invalid CONNECT path, expected host:port".to_string())
+            n0_error::AnyError::from_string("Invalid CONNECT path, expected host:port".to_string())
         })?;
 
         // Strip scheme and end slashes if present.
@@ -456,10 +463,9 @@ impl Request {
             .trim_end_matches('/')
             .parse()
             .map_err(|e| {
-                // whatever!("Invalid port number {port_str}: {}", e)
-                n0_snafu::Error::without_source(format!("Invalid port number {port_str}: {}", e))
+                n0_error::AnyError::from_string(format!("Invalid port number {port_str}: {}", e))
             })
-            .e()?;
+            .anyerr()?;
 
         Ok(Self::Connect(ProxyConnectRequest {
             host: host.to_string(),
@@ -478,7 +484,7 @@ async fn send_connect_error(stream: &mut TcpStream, status: u16, message: &str) 
     stream
         .write_all(response.as_bytes())
         .await
-        .map_err(|_| n0_snafu::Error::without_source("writing connect response".to_string()))?;
+        .map_err(|_| n0_error::AnyError::from_string("writing connect response".to_string()))?;
     Ok(())
 }
 
@@ -489,10 +495,10 @@ async fn handle_connect_handshake(
     let n = client_stream
         .read(&mut buffer)
         .await
-        .context("Failed to read CONNECT request")?;
+        .std_context("Failed to read CONNECT request")?;
 
     if n == 0 {
-        return Err(n0_snafu::Error::without_source(
+        return Err(n0_error::AnyError::from_string(
             "Client closed connection before sending request".to_string(),
         ));
     }

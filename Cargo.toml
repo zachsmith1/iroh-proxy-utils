@@ -6,11 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 httparse = "1.10.1"
-iroh = "0.94.0"
-n0-snafu = "0.2.2"
+iroh = "0.95"
+n0-error = "0.1"
 quinn = { version = "0.14", package = "iroh-quinn" }
 reqwest = "0.12"
-snafu = "0.8.9"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = "0.7.16"
 tracing = "0.1.41"

@@ -1,10 +1,9 @@
-use iroh::{Endpoint, EndpointAddr, endpoint::Connecting};
-use n0_snafu::{Result, ResultExt};
-use snafu::whatever;
+use iroh::{Endpoint, EndpointAddr, endpoint::Accepting};
+use n0_error::{Result, StdResultExt, anyerr, e, ensure_any};
 use std::{io, net::SocketAddr};
 use tokio_util::sync::CancellationToken;
 
-use crate::quinn_util::forward_bidi;
+use crate::{error::TcpProxyError, quinn_util::forward_bidi};
 
 /// The ALPN for dumbpipe.
 ///
@@ -60,7 +59,11 @@ pub async fn connect_tcp(
         Ok(tcp_listener) => tcp_listener,
         Err(cause) => {
             tracing::error!("error binding tcp socket to {:?}: {}", listen, cause);
-            whatever!("error binding tcp socket to {:?}: {}", listen, cause);
+            return Err(anyerr!(
+                "error binding tcp socket to {:?}: {}",
+                listen,
+                cause
+            ));
         }
     };
     tracing::info!("tcp listening on {:?}", listen);
@@ -73,25 +76,31 @@ pub async fn connect_tcp(
         handshake: bool,
         alpn: &[u8],
     ) -> Result<()> {
-        let (tcp_stream, tcp_addr) = next.context("error accepting tcp connection")?;
+        let (tcp_stream, tcp_addr) =
+            next.map_err(|source| e!(TcpProxyError::TcpAccept { source }))?;
         let (tcp_recv, tcp_send) = tcp_stream.into_split();
         tracing::info!("got tcp connection from {}", tcp_addr);
         let remote_ep_id = addr.id;
-        let connection = endpoint
-            .connect(addr, alpn)
-            .await
-            .context(format!("error connecting to {remote_ep_id}"))?;
-        let (mut endpoint_send, endpoint_recv) = connection
-            .open_bi()
-            .await
-            .context(format!("error opening bidi stream to {remote_ep_id}"))?;
-        // send the handshake unless we are using a custom alpn
-        // when using a custom alpn, everything is up to the user
+        let connection = endpoint.connect(addr, alpn).await.map_err(|source| {
+            e!(TcpProxyError::EndpointConnect {
+                endpoint_id: remote_ep_id,
+                source
+            })
+        })?;
+        let (mut endpoint_send, endpoint_recv) = connection.open_bi().await.map_err(|source| {
+            e!(TcpProxyError::OpenBidi {
+                endpoint_id: remote_ep_id,
+                source
+            })
+        })?;
+
         if handshake {
-            // the connecting side must write first. we don't know if there will be something
-            // on stdin, so just write a handshake.
-            endpoint_send.write_all(&HANDSHAKE).await.e()?;
+            endpoint_send
+                .write_all(&HANDSHAKE)
+                .await
+                .map_err(|_| e!(TcpProxyError::InvalidHandshake))?;
         }
+
         forward_bidi(
             tcp_recv,
             tcp_send,
@@ -99,7 +108,7 @@ pub async fn connect_tcp(
             endpoint_send.into(),
         )
         .await?;
-        Ok::<_, n0_snafu::Error>(())
+        Ok(())
     }
 
     let forward_2 = forward.clone();
@@ -173,27 +182,27 @@ pub async fn listen_tcp(
 
     // handle a new incoming connection on the endpoint
     async fn handle_endpoint_accept(
-        connecting: Connecting,
+        accepting: Accepting,
         addrs: Vec<SocketAddr>,
         handshake: bool,
     ) -> Result<()> {
-        let connection = connecting.await.context("error accepting connection")?;
-        let remote_node_id = &connection.remote_id()?;
-        tracing::info!("got connection from {}", remote_node_id);
+        let connection = accepting.await.std_context("error accepting connection")?;
+        let remote_endpoint_id = &connection.remote_id();
+        tracing::info!("got connection from {}", remote_endpoint_id);
         let (s, mut r) = connection
             .accept_bi()
             .await
-            .context("error accepting stream")?;
-        tracing::info!("accepted bidi stream from {}", remote_node_id);
+            .map_err(|source| e!(TcpProxyError::EndpointAccept { source }))?;
+        tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
         if handshake {
             // read the handshake and verify it
             let mut buf = [0u8; HANDSHAKE.len()];
-            r.read_exact(&mut buf).await.e()?;
-            snafu::ensure_whatever!(buf == HANDSHAKE, "invalid handshake");
+            r.read_exact(&mut buf).await.anyerr()?;
+            ensure_any!(buf == HANDSHAKE, "invalid handshake");
         }
         let connection = tokio::net::TcpStream::connect(addrs.as_slice())
             .await
-            .context(format!("error connecting to {addrs:?}"))?;
+            .std_context(format!("error connecting to {addrs:?}"))?;
         let (read, write) = connection.into_split();
         forward_bidi(read, write, r, s).await?;
         Ok(())
@@ -215,13 +224,13 @@ pub async fn listen_tcp(
             let Some(incoming) = incoming else {
                 break;
             };
-            let Ok(connecting) = incoming.accept() else {
+            let Ok(accepting) = incoming.accept() else {
                 break;
             };
             let addrs = forward_to_2.clone();
             let handshake = true;
             tokio::spawn(async move {
-                if let Err(cause) = handle_endpoint_accept(connecting, addrs, handshake).await {
+                if let Err(cause) = handle_endpoint_accept(accepting, addrs, handshake).await {
                     // log error at warn level
                     //
                     // we should know about it, but it's not fatal
