@@ -3,7 +3,7 @@ use n0_error::{Result, StdResultExt, anyerr, e, ensure_any};
 use std::{io, net::SocketAddr};
 use tokio_util::sync::CancellationToken;
 
-use crate::{error::TcpProxyError, quinn_util::forward_bidi};
+use crate::{error::TcpProxyError, util::forward_bidi};
 
 /// The ALPN for dumbpipe.
 ///

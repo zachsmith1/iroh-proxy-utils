@@ -13,7 +13,7 @@ fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
 /// Bidirectionally forward data from a quinn stream and an arbitrary tokio
 /// reader/writer pair, aborting both sides when either one forwarder is done,
 /// or when control-c is pressed.
-pub(crate) async fn forward_bidi(
+pub async fn forward_bidi(
     from1: impl AsyncRead + Send + Sync + Unpin + 'static,
     to1: impl AsyncWrite + Send + Sync + Unpin + 'static,
     from2: quinn::RecvStream,
@@ -22,7 +22,8 @@ pub(crate) async fn forward_bidi(
     let token1 = CancellationToken::new();
     let token2 = token1.clone();
     let token3 = token1.clone();
-    let forward_from_stdin = tokio::spawn(async move {
+
+    let forward_from_input_stream = tokio::spawn(async move {
         copy_to_quinn(from1, to2, token1.clone())
             .await
             .map_err(cancel_token(token1))
@@ -38,7 +39,7 @@ pub(crate) async fn forward_bidi(
         io::Result::Ok(())
     });
     forward_to_stdout.await.anyerr()?.anyerr()?;
-    forward_from_stdin.await.anyerr()?.anyerr()?;
+    forward_from_input_stream.await.anyerr()?.anyerr()?;
     Ok(())
 }
 
@@ -53,7 +54,6 @@ pub(crate) async fn copy_to_quinn(
     mut send: quinn::SendStream,
     token: CancellationToken,
 ) -> io::Result<u64> {
-    tracing::trace!("copying to quinn");
     tokio::select! {
         res = tokio::io::copy(&mut from, &mut send) => {
             let size = res?;
