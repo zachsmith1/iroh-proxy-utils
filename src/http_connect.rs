@@ -261,16 +261,21 @@ impl TunnelClientStreams {
     }
 
     pub async fn new_streams(&self) -> Result<(SendStream, RecvStream)> {
-        let (mut tunnel_tx, tunnel_rx) = self
+        let (mut tunnel_send, tunnel_recv) = self
             .conn
             .open_bi()
             .await
             .std_context("opening bidi stream")?;
-        tunnel_tx.write(STREAM_OPEN_HANDSHAKE).await.map_err(|_| {
-            n0_error::AnyError::from_string("sending connect handshake response".to_string())
-        })?;
+        tunnel_send
+            .write(STREAM_OPEN_HANDSHAKE)
+            .await
+            .map_err(|_| {
+                n0_error::AnyError::from_string("sending connect handshake response".to_string())
+            })?;
 
-        Ok((tunnel_tx, tunnel_rx))
+        debug!("created new streams * completed handshake");
+
+        Ok((tunnel_send, tunnel_recv))
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
