@@ -1,10 +1,12 @@
+use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use httparse::{self, Header};
-use iroh::endpoint::{Accepting, Connection};
+use iroh::endpoint::Connection;
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey};
 use n0_error::{AnyError, Result, StdResultExt, anyerr, ensure_any};
 use quinn::{RecvStream, SendStream, VarInt};
@@ -30,7 +32,7 @@ const STREAM_OPEN_HANDSHAKE: &[u8] = b"OPEN";
 /// If a stream sends this message, we'll gacefully close the connection
 const CLIENT_CLOSE_MESSAGE: &[u8] = b"DONE";
 
-pub trait AuthHandler: Send + Sync {
+pub trait AuthHandler: Send + Sync + Debug {
     fn authorize<'a>(
         &'a self,
         req: &'a Request,
@@ -38,6 +40,7 @@ pub trait AuthHandler: Send + Sync {
 }
 
 /// NoAuthHandler rejects all requests
+#[derive(Debug)]
 pub struct NoAuthHandler;
 
 impl AuthHandler for NoAuthHandler {
@@ -46,6 +49,152 @@ impl AuthHandler for NoAuthHandler {
         _req: &'a Request,
     ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>> {
         Box::pin(async move { Ok(false) })
+    }
+}
+
+/// Listeners are the "Server" side of a tunnel construction. Building a tunnel
+/// requires a listener first be constructed & attached to an endpoint as a
+/// protocol handler.
+#[derive(Debug)]
+pub struct TunnelListener {
+    auth: Arc<Box<dyn AuthHandler>>,
+}
+
+impl TunnelListener {
+    pub fn new(auth: Arc<Box<dyn AuthHandler>>) -> Result<Self> {
+        Ok(Self { auth })
+    }
+
+    async fn accept_data_stream(
+        connection: &Connection,
+    ) -> Result<Option<(SendStream, RecvStream)>> {
+        let (endpoint_send, mut endpoint_recv) = connection
+            .accept_bi()
+            .await
+            .std_context("error accepting stream 2")?;
+
+        // TODO - we're relying on the fact that the length of open & done messages are equal here
+        let mut buf = [0u8; STREAM_OPEN_HANDSHAKE.len()];
+        endpoint_recv.read_exact(&mut buf).await.anyerr()?;
+        if buf == CLIENT_CLOSE_MESSAGE {
+            return Ok(None);
+        }
+        ensure_any!(buf == STREAM_OPEN_HANDSHAKE, "invalid handshake");
+        Ok(Some((endpoint_send, endpoint_recv)))
+    }
+
+    async fn handle_connect_request(
+        connection: Connection,
+        mut s: SendStream,
+        req: ProxyConnectRequest,
+    ) -> std::result::Result<(), AcceptError> {
+        s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .map_err(|_| {
+                n0_error::AnyError::from_string("sending connect success response".to_string())
+            })?;
+        s.finish()
+            .std_context("finishing tunnel construction stream")?;
+
+        // loop to construct one TCP stream per data request, this allows multiple
+        // TCP connections to use the same tunnel
+        loop {
+            let conn = connection.clone();
+            let Some((proxied_send, proxied_recv)) = Self::accept_data_stream(&conn).await? else {
+                // if accept_data_stream returns None, it's time to close the tunnel
+                break;
+            };
+            trace!("got data stream");
+
+            // open a TCP stream to the specified target
+            let target_stream = req.tcp_stream().await?;
+            let (tcp_recv, tcp_send) = target_stream.into_split();
+            let remote_endpoint_id = conn.remote_id();
+            tokio::task::spawn(async move {
+                let res: n0_error::Result<()> = async {
+                    debug!("forwarding TCP stream data to bidi QUIC stream");
+                    forward_bidi(tcp_recv, tcp_send, proxied_recv.into(), proxied_send.into())
+                        .await?;
+
+                    info!(remote_node_id = %remote_endpoint_id.fmt_short(), "connection completed");
+
+                    Ok(())
+                }
+                .await;
+
+                if let Err(err) = res {
+                    warn!("connection close error: {:?}", err);
+                }
+            });
+        }
+        trace!("closing tunnel listener");
+        Ok(())
+    }
+
+    async fn handle_http_request(
+        connection: Connection,
+        mut s: SendStream,
+        req: ProxyHttpRequest,
+    ) -> std::result::Result<(), AcceptError> {
+        // close the initial stream, we don't need to ACK.
+        s.finish().anyerr()?;
+
+        let Some((mut proxied_send, _)) = Self::accept_data_stream(&connection).await? else {
+            debug!("tunnel connection closed");
+            return Ok(());
+        };
+
+        let client = reqwest::Client::new();
+        let method = reqwest::Method::from_str(&req.method).map_err(|_| {
+            n0_error::AnyError::from_string("invalid HTTP request method".to_string())
+        })?;
+        let res = client.request(method, req.path).send().await.anyerr()?;
+        // TODO - pipe the response instead of buffering
+        let body = res.bytes().await.anyerr()?;
+        proxied_send.write_all(&body).await.anyerr()?;
+        proxied_send.finish().anyerr()?;
+        Ok(())
+    }
+
+    // pub fn close(&self) {
+    //     self.cancel.cancel();
+    //     // TODO - wait & close gracefully
+    //     self.handle.abort();
+    // }
+}
+
+impl ProtocolHandler for TunnelListener {
+    async fn accept(
+        &self,
+        connection: Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let remote_endpoint_id = &connection.remote_id();
+        debug!(remote_node_id = %remote_endpoint_id.fmt_short(), "got connection");
+
+        // accept a bidi stream to do the HTTP CONNECT handshake
+        let (s, mut r) = connection
+            .accept_bi()
+            .await
+            .std_context("error accepting stream")?;
+        trace!("accepted bidi stream from {}", remote_endpoint_id);
+
+        let mut buffer = vec![0u8; CONNECT_HANDSHAKE_MAX_LENGTH];
+        r.read(&mut buffer).await.std_context("reading handshake")?;
+        let req = Request::parse(&buffer)?;
+        warn!(req = ?req, "read handshake");
+
+        // TODO - make errors real
+        self.auth
+            .authorize(&req)
+            .await
+            .map_err(|_| n0_error::AnyError::from_string("unauthorized".to_string()))?;
+
+        trace!("client is authorized");
+
+        match req {
+            Request::Connect(req) => Self::handle_connect_request(connection, s, req).await,
+            Request::Http(req) => Self::handle_http_request(connection, s, req).await,
+        }
     }
 }
 
@@ -338,191 +487,6 @@ impl TunnelClientStreams {
             }
         });
         Ok(handle)
-    }
-}
-
-#[derive(Debug)]
-pub struct HttpConnectListenerHandle {
-    endpoint: Endpoint,
-    cancel: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl HttpConnectListenerHandle {
-    pub async fn listen(
-        endpoint: Endpoint,
-        auth: Option<Arc<Box<dyn AuthHandler>>>,
-    ) -> Result<Self> {
-        tracing::info!(endpoint_id = %endpoint.addr().id.fmt_short(), "listening for HTTP CONNECT requests over iroh");
-
-        let endpoint_2 = endpoint.clone();
-        let cancel = CancellationToken::new();
-        let cancel_2 = cancel.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let incoming = tokio::select! {
-                    incoming = endpoint_2.accept() => incoming,
-                    _ = cancel_2.cancelled() => {
-                        tracing::debug!("got cancel token, shutting down HTTP CONNECT listener");
-                        break;
-                    }
-                };
-                let Some(incoming) = incoming else {
-                    break;
-                };
-                let Ok(accepting) = incoming.accept() else {
-                    break;
-                };
-                let auth = auth.clone();
-                tokio::spawn(async move {
-                    if let Err(cause) = Self::handle_endpoint_accept(accepting, auth).await {
-                        tracing::warn!("error handling connection: {}", cause);
-                    }
-                });
-            }
-        });
-
-        Ok(Self {
-            cancel,
-            endpoint,
-            handle,
-        })
-    }
-
-    // handle a new incoming connection on the endpoint
-    async fn handle_endpoint_accept(
-        accepting: Accepting,
-        auth: Option<Arc<Box<dyn AuthHandler>>>,
-    ) -> Result<()> {
-        let connection = accepting.await.std_context("error accepting connection")?;
-        let remote_endpoint_id = &connection.remote_id();
-        info!(remote_node_id = %remote_endpoint_id.fmt_short(), "got connection");
-
-        // accept a bidi stream to do the HTTP CONNECT handshake
-        let (s, mut r) = connection
-            .accept_bi()
-            .await
-            .std_context("error accepting stream")?;
-        debug!("accepted bidi stream from {}", remote_endpoint_id);
-
-        let mut buffer = vec![0u8; CONNECT_HANDSHAKE_MAX_LENGTH];
-        r.read(&mut buffer).await.std_context("reading handshake")?;
-        let req = Request::parse(&buffer)?;
-        warn!(req = ?req, "read handshake");
-
-        if let Some(handler) = auth {
-            // TODO - make errors real
-            handler
-                .authorize(&req)
-                .await
-                .map_err(|_| n0_error::AnyError::from_string("unauthorized".to_string()))?;
-            debug!("client is authorized");
-        }
-
-        match req {
-            Request::Connect(req) => Self::handle_connect_request(connection, s, req).await,
-            Request::Http(req) => Self::handle_http_request(connection, s, req).await,
-        }
-    }
-
-    async fn accept_data_stream(
-        connection: &Connection,
-    ) -> Result<Option<(SendStream, RecvStream)>> {
-        let (endpoint_send, mut endpoint_recv) = connection
-            .accept_bi()
-            .await
-            .std_context("error accepting stream 2")?;
-
-        // TODO - we're relying on the fact that the length of open & done messages are equal here
-        let mut buf = [0u8; STREAM_OPEN_HANDSHAKE.len()];
-        endpoint_recv.read_exact(&mut buf).await.anyerr()?;
-        if buf == CLIENT_CLOSE_MESSAGE {
-            return Ok(None);
-        }
-        ensure_any!(buf == STREAM_OPEN_HANDSHAKE, "invalid handshake");
-        Ok(Some((endpoint_send, endpoint_recv)))
-    }
-
-    async fn handle_connect_request(
-        connection: Connection,
-        mut s: SendStream,
-        req: ProxyConnectRequest,
-    ) -> Result<()> {
-        s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .map_err(|_| {
-                n0_error::AnyError::from_string("sending connect success response".to_string())
-            })?;
-        s.finish().std_context("finishing stream")?;
-
-        // loop to construct one TCP stream per data request, this allows multiple
-        // TCP connections to use the same tunnel
-        loop {
-            let conn = connection.clone();
-            let Some((proxied_send, proxied_recv)) = Self::accept_data_stream(&conn).await? else {
-                // if accept_data_stream returns None, it's time to close the tunnel
-                break;
-            };
-            trace!("got data stream");
-
-            // open a TCP stream to the specified target
-            let target_stream = req.tcp_stream().await?;
-            let (tcp_recv, tcp_send) = target_stream.into_split();
-            let remote_endpoint_id = conn.remote_id();
-            tokio::task::spawn(async move {
-                let res: n0_error::Result<()> = async {
-                    debug!("forwarding TCP stream data to bidi QUIC stream");
-                    forward_bidi(tcp_recv, tcp_send, proxied_recv.into(), proxied_send.into())
-                        .await?;
-
-                    info!(remote_node_id = %remote_endpoint_id.fmt_short(), "connection completed");
-
-                    Ok(())
-                }
-                .await;
-
-                if let Err(err) = res {
-                    warn!("connection close error: {:?}", err);
-                }
-            });
-        }
-        trace!("closing tunnel listener");
-        Ok(())
-    }
-
-    async fn handle_http_request(
-        connection: Connection,
-        mut s: SendStream,
-        req: ProxyHttpRequest,
-    ) -> Result<()> {
-        // close the initial stream, we don't need to ACK.
-        s.finish().anyerr()?;
-
-        let Some((mut proxied_send, _)) = Self::accept_data_stream(&connection).await? else {
-            debug!("tunnel connection closed");
-            return Ok(());
-        };
-
-        let client = reqwest::Client::new();
-        let method = reqwest::Method::from_str(&req.method).map_err(|_| {
-            n0_error::AnyError::from_string("invalid HTTP request method".to_string())
-        })?;
-        let res = client.request(method, req.path).send().await.anyerr()?;
-        // TODO - pipe the response instead of buffering
-        let body = res.bytes().await.anyerr()?;
-        proxied_send.write_all(&body).await.anyerr()?;
-        proxied_send.finish().anyerr()?;
-        Ok(())
-    }
-
-    pub fn receiving(&self) -> &Endpoint {
-        &self.endpoint
-    }
-
-    pub fn close(&self) {
-        self.cancel.cancel();
-        // TODO - wait & close gracefully
-        self.handle.abort();
     }
 }
 
