@@ -202,8 +202,6 @@ impl HttpConnectClientHandle {
 #[derive(Debug)]
 pub struct TunnelClientStreams {
     conn: Connection,
-    tunnel_tx: SendStream,
-    tunnel_rx: RecvStream,
 }
 
 impl TunnelClientStreams {
@@ -239,21 +237,16 @@ impl TunnelClientStreams {
             .anyerr()?;
 
         let data = connect_handshake_rx.read_to_end(1000).await.anyerr()?;
-        info!(
+        // TODO - need to examine response & make sure it's ok, right now we're assuming it's ok :/
+        debug!(
             "http connect response: {:?}",
             String::from_utf8_lossy(&data)
         );
 
-        let (mut tunnel_tx, tunnel_rx) = conn.open_bi().await.std_context("opening bidi stream")?;
-        tunnel_tx.write(STREAM_OPEN_HANDSHAKE).await.map_err(|_| {
-            n0_error::AnyError::from_string("sending connect handshake response".to_string())
-        })?;
+        // At this point the tunnel is ready. users of this struct should call `new_streams`
+        // for an owned set of streams that actually send data. Each stream pair maps to a TCP stream
 
-        Ok(Self {
-            conn,
-            tunnel_tx,
-            tunnel_rx,
-        })
+        Ok(Self { conn })
     }
 
     pub fn remote_id(&self) -> EndpointId {
@@ -276,17 +269,6 @@ impl TunnelClientStreams {
         debug!("created new streams * completed handshake");
 
         Ok((tunnel_send, tunnel_recv))
-    }
-
-    pub async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        self.tunnel_tx
-            .write_all(buf)
-            .await
-            .std_context("write all to tunnel")
-    }
-
-    pub async fn split(self) -> (SendStream, RecvStream) {
-        (self.tunnel_tx, self.tunnel_rx)
     }
 
     pub fn close(&self) {
@@ -414,19 +396,19 @@ impl HttpConnectListenerHandle {
     ) -> Result<()> {
         let connection = accepting.await.std_context("error accepting connection")?;
         let remote_endpoint_id = &connection.remote_id();
-        tracing::info!(remote_node_id = %remote_endpoint_id.fmt_short(), "got connection");
+        info!(remote_node_id = %remote_endpoint_id.fmt_short(), "got connection");
 
         // accept a bidi stream to do the HTTP CONNECT handshake
         let (s, mut r) = connection
             .accept_bi()
             .await
             .std_context("error accepting stream")?;
-        tracing::debug!("accepted bidi stream from {}", remote_endpoint_id);
+        debug!("accepted bidi stream from {}", remote_endpoint_id);
 
         let mut buffer = vec![0u8; CONNECT_HANDSHAKE_MAX_LENGTH];
         r.read(&mut buffer).await.std_context("reading handshake")?;
         let req = Request::parse(&buffer)?;
-        tracing::warn!(req = ?req, "read handshake");
+        warn!(req = ?req, "read handshake");
 
         if let Some(handler) = auth {
             // TODO - make errors real
@@ -434,6 +416,7 @@ impl HttpConnectListenerHandle {
                 .authorize(&req)
                 .await
                 .map_err(|_| n0_error::AnyError::from_string("unauthorized".to_string()))?;
+            debug!("client is authorized");
         }
 
         match req {
