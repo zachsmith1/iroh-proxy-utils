@@ -57,12 +57,14 @@ impl AuthHandler for NoAuthHandler {
 /// protocol handler.
 #[derive(Debug)]
 pub struct TunnelListener {
-    auth: Arc<Box<dyn AuthHandler>>,
+    auth: Arc<dyn AuthHandler>,
 }
 
 impl TunnelListener {
-    pub fn new(auth: Arc<Box<dyn AuthHandler>>) -> Result<Self> {
-        Ok(Self { auth })
+    pub fn new(auth: impl AuthHandler + 'static) -> Result<Self> {
+        Ok(Self {
+            auth: Arc::new(auth),
+        })
     }
 
     async fn accept_data_stream(
