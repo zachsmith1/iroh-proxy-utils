@@ -134,8 +134,15 @@ impl DownstreamProxy {
 
     /// Serves a single HTTP/2 connection with CONNECT streams.
     async fn forward_h2_stream(&self, conn: TcpStream, mode: &ProxyMode) -> Result<()> {
-        let mut connection =
-            h2::server::handshake(conn).await.map_err(|err| anyerr!(err))?;
+        let mut builder = h2::server::Builder::new();
+        builder
+            .initial_window_size(1 << 20)
+            .initial_connection_window_size(1 << 20)
+            .max_concurrent_streams(1024);
+        let mut connection = builder
+            .handshake(conn)
+            .await
+            .map_err(|err| anyerr!(err))?;
         while let Some(result) = connection.accept().await {
             let (request, respond) = result.map_err(|err| anyerr!(err))?;
             let this = self.clone();
@@ -469,7 +476,8 @@ async fn copy_upstream_to_h2(
         total += read as u64;
         let mut offset = 0;
         while offset < read {
-            let capacity = await_capacity(send_stream, read - offset).await?;
+            let want = read - offset;
+            let capacity = await_capacity(send_stream, want).await?;
             if capacity == 0 {
                 tracing::trace!("h2 send_stream closed while forwarding");
                 return Ok(total);
