@@ -11,10 +11,10 @@ mod prebuffered;
 ///
 /// Calls `finish` on the SendStream once done.
 pub(crate) async fn forward_bidi(
-    downstream_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    downstream_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
-    upstream_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    upstream_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
+    downstream_recv: &mut (impl AsyncRead + Send + Unpin),
+    downstream_send: &mut (impl AsyncWrite + Send + Unpin),
+    upstream_recv: &mut (impl AsyncRead + Send + Unpin),
+    upstream_send: &mut (impl AsyncWrite + Send + Unpin),
 ) -> Result<(u64, u64)> {
     let start = n0_future::time::Instant::now();
     let (r1, r2) = tokio::join!(

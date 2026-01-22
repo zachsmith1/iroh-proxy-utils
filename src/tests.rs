@@ -1,11 +1,12 @@
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::OnceLock, time::Duration};
 
+use bytes::Bytes;
 use http::StatusCode;
 use iroh::{
     Endpoint, EndpointId, discovery::static_provider::StaticProvider, endpoint::BindError,
     protocol::Router,
 };
-use n0_error::{AnyError, Result, StackResultExt, StdResultExt, stack_error};
+use n0_error::{AnyError, Result, StackResultExt, StdResultExt, anyerr, stack_error};
 use n0_future::task::AbortOnDropHandle;
 use n0_tracing_test::traced_test;
 use tokio::{
@@ -68,6 +69,20 @@ async fn spawn_downstream_proxy(
     let tcp_addr = listener.local_addr()?;
     debug!(endpoint_id=%endpoint_id.fmt_short(), %tcp_addr, "spawned downstream proxy");
     let task = tokio::spawn(async move { proxy.forward_tcp_listener(listener, mode).await });
+    Ok((tcp_addr, endpoint_id, AbortOnDropHandle::new(task)))
+}
+
+/// Spawns a downstream proxy serving HTTP/2 CONNECT.
+async fn spawn_downstream_h2_proxy(
+    mode: ProxyMode,
+) -> Result<(SocketAddr, EndpointId, AbortOnDropHandle<Result>)> {
+    let endpoint = bind_endpoint().await?;
+    let endpoint_id = endpoint.id();
+    let proxy = DownstreamProxy::new(endpoint, Default::default());
+    let listener = TcpListener::bind("localhost:0").await?;
+    let tcp_addr = listener.local_addr()?;
+    debug!(endpoint_id=%endpoint_id.fmt_short(), %tcp_addr, "spawned downstream h2 proxy");
+    let task = tokio::spawn(async move { proxy.forward_h2_listener(listener, mode).await });
     Ok((tcp_addr, endpoint_id, AbortOnDropHandle::new(task)))
 }
 
@@ -151,6 +166,13 @@ async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<(u1
         .anyerr()??;
     let (header_len, response) =
         HttpResponse::parse_with_len(&buf)?.context("Incomplete HTTP response")?;
+    Ok((response.status.as_u16(), buf[header_len..].to_vec()))
+}
+
+/// Parses a HTTP/1 response from raw bytes and returns (status_code, body).
+fn read_http_response_from_bytes(buf: &[u8]) -> Result<(u16, Vec<u8>)> {
+    let (header_len, response) =
+        HttpResponse::parse_with_len(buf)?.context("Incomplete HTTP response")?;
     Ok((response.status.as_u16(), buf[header_len..].to_vec()))
 }
 
@@ -312,6 +334,126 @@ async fn test_http_forward_connect() -> Result {
     assert_eq!(status, 200);
     assert_eq!(body, b"origin GET /tunnel/test");
     proxy_task.abort();
+    upstream_router.shutdown().await.anyerr()?;
+    origin_task.abort();
+    Ok(())
+}
+
+/// HTTP/2 CONNECT forward proxy tunnels bytes end-to-end.
+#[tokio::test]
+#[traced_test]
+async fn test_http2_forward_connect() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, origin_task) = spawn_origin_server("origin").await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, proxy_task) = spawn_downstream_h2_proxy(mode).await?;
+
+    let stream = TcpStream::connect(proxy_addr).await?;
+    let (mut client, connection) = h2::client::handshake(stream)
+        .await
+        .map_err(|err| anyerr!(err))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!("http://{origin_addr}"))
+        .body(())
+        .anyerr()?;
+    let (response_future, mut send_stream) = client
+        .send_request(request, false)
+        .map_err(|err| anyerr!(err))?;
+    let response = response_future.await.map_err(|err| anyerr!(err))?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    send_stream
+        .send_data(
+            Bytes::from_static(
+                b"GET /tunnel/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ),
+            true,
+        )
+        .map_err(|err| anyerr!(err))?;
+
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|err| anyerr!(err))?;
+        buf.extend_from_slice(&chunk);
+    }
+    let (status, body) = read_http_response_from_bytes(&buf)?;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"origin GET /tunnel/test");
+
+    drop(proxy_task);
+    upstream_router.shutdown().await.anyerr()?;
+    origin_task.abort();
+    Ok(())
+}
+
+/// HTTP/2 CONNECT forward proxy multiplexes multiple tunnels on one connection.
+#[tokio::test]
+#[traced_test]
+async fn test_http2_forward_connect_multiplex() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, origin_task) = spawn_origin_server("origin").await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, proxy_task) = spawn_downstream_h2_proxy(mode).await?;
+
+    let stream = TcpStream::connect(proxy_addr).await?;
+    let (client, connection) = h2::client::handshake(stream)
+        .await
+        .map_err(|err| anyerr!(err))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let streams = 5usize;
+    let mut handles = Vec::with_capacity(streams);
+    for i in 0..streams {
+        let mut client = client.clone();
+        let origin_addr = origin_addr.to_string();
+        handles.push(tokio::spawn(async move {
+            let request = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri(format!("http://{origin_addr}"))
+                .body(())
+                .anyerr()?;
+            let (response_future, mut send_stream) =
+                client.send_request(request, false).map_err(|err| anyerr!(err))?;
+            let response = response_future.await.map_err(|err| anyerr!(err))?;
+            if response.status() != StatusCode::OK {
+                return Err(anyerr!("unexpected status {}", response.status()));
+            }
+            let payload = format!(
+                "GET /tunnel/mux/{i} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            send_stream
+                .send_data(Bytes::from(payload), true)
+                .map_err(|err| anyerr!(err))?;
+            let mut body = response.into_body();
+            let mut buf = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(|err| anyerr!(err))?;
+                buf.extend_from_slice(&chunk);
+            }
+            let (status, body) = read_http_response_from_bytes(&buf)?;
+            Ok::<_, AnyError>((status, body))
+        }));
+    }
+
+    for (i, handle) in handles.into_iter().enumerate() {
+        let (status, body) = handle.await.anyerr()?.anyerr()?;
+        assert_eq!(status, 200);
+        assert_eq!(body, format!("origin GET /tunnel/mux/{i}").as_bytes());
+    }
+
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     origin_task.abort();
     Ok(())

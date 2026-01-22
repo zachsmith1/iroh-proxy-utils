@@ -1641,6 +1641,7 @@ dependencies = [
  "bytes",
  "derive_more",
  "dynosaur",
+ "h2",
  "http",
  "http-body-util",
  "httparse",

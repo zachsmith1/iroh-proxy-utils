@@ -6,7 +6,6 @@ use iroh::EndpointId;
 use iroh_blobs::util::connection_pool;
 use n0_error::{Result, anyerr, stack_error};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tracing::debug;
 
 use crate::{
     HttpOriginRequest, HttpProxyRequest,
