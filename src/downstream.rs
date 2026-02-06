@@ -1,29 +1,56 @@
-use std::{fmt::Debug, io};
+use std::{convert::Infallible, fmt::Debug, io, net::SocketAddr};
 
-use http::StatusCode;
+use bytes::Bytes;
+use http::{Method, StatusCode};
+use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
+use hyper::{
+    Request, Response,
+    body::{Frame, Incoming},
+    service::service_fn,
+};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
 use iroh::{
     Endpoint, EndpointId,
     endpoint::{RecvStream, SendStream},
 };
 use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef};
-use n0_error::{AnyError, Result, anyerr, stack_error};
+use n0_error::{AnyError, Result, StdResultExt, anyerr, stack_error};
+use n0_future::TryStreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, warn};
 
 pub use self::opts::{
-    ExtractError, ForwardProxyMode, ForwardProxyResolver, HttpProxyOpts, PoolOpts, ProxyMode,
-    ReverseProxyMode, ReverseProxyResolver, WriteErrorResponse,
+    Deny, ErrorResponder, HttpProxyOpts, PoolOpts, ProxyMode, RequestHandler, RequestHandlerChain,
+    StaticForwardProxy, StaticReverseProxy,
 };
 use crate::{
     ALPN, Authority, HEADER_SECTION_MAX_LENGTH,
     parse::{HttpRequest, HttpResponse},
-    util::{Prebuffered, forward_bidi},
+    util::{Prebuffered, forward_bidi, recv_to_stream},
 };
 
 pub(crate) mod opts;
 
-/// Accepts TCP streams and forwards them to upstream iroh destinations.
+/// Proxy that accepts TCP connections and forwards them over iroh.
+///
+/// The downstream proxy is the client-facing component that receives incoming
+/// TCP connections (typically HTTP requests) and routes them to upstream proxies
+/// via iroh's peer-to-peer QUIC connections.
+///
+/// # Modes
+///
+/// - **TCP mode**: Blindly tunnels all traffic to a fixed upstream destination.
+/// - **HTTP mode**: Parses HTTP requests to enable dynamic routing and supports
+///   both forward proxy (absolute-form) and reverse proxy (origin-form) requests.
+///
+/// # Connection Pooling
+///
+/// Maintains a pool of iroh connections to upstream endpoints for efficiency.
+/// Multiple requests to the same endpoint share a single QUIC connection.
 #[derive(Clone, Debug)]
 pub struct DownstreamProxy {
     pool: ConnectionPool,
@@ -80,7 +107,12 @@ impl DownstreamProxy {
                     .child_token()
                     .run_until_cancelled_owned(async move {
                         debug!(%client_addr, "accepted TCP connection");
-                        this.forward_tcp_stream(client_stream, &mode).await.ok();
+                        if let Err(err) = this
+                            .forward_tcp_stream(client_addr, client_stream, &mode)
+                            .await
+                        {
+                            warn!("Failed to handle TCP connection: {err:#}");
+                        }
                     })
                     .instrument(error_span!("tcp-accept", id)),
             );
@@ -94,71 +126,50 @@ impl DownstreamProxy {
     /// to the configured [`HttpProxyOpts`].
     /// For [`ProxyMode::Tcp`], this creates a CONNECT tunnel to the configured upstream and authority, and forwards the TCP
     /// stream without parsing anything.
-    pub async fn forward_tcp_stream(&self, mut conn: TcpStream, mode: &ProxyMode) -> Result<()> {
-        if let Err(err) = self.forward_tcp_stream_inner(&mut conn, mode).await {
-            warn!("Error while forwarding TCP stream: {err:#}");
-            // If this is a HTTP proxy, write an error response if the error is a proxy error.
-            if let ProxyMode::Http(opts) = mode
-                && let Some(response) = err.to_response()
-            {
-                debug!(?response, "send error response");
-                if let Err(err) = opts.write_error_response(&response, &mut conn).await {
-                    debug!("failed to send error response: {err:#}");
-                }
-            }
-            Err(err.into())
-        } else {
-            debug!("Forwarded stream closed");
-            Ok(())
-        }
-    }
-
-    async fn forward_tcp_stream_inner(
+    async fn forward_tcp_stream(
         &self,
-        conn: &mut TcpStream,
+        src_addr: SocketAddr,
+        mut tcp_stream: TcpStream,
         mode: &ProxyMode,
-    ) -> Result<(), ProxyError> {
-        let (tcp_recv, mut tcp_send) = conn.split();
-
-        // We only need to prebuffer for HTTP mode.
-        let prebuffer_max_len = match mode {
-            ProxyMode::Tcp(_) => 0,
-            ProxyMode::Http(_) => HEADER_SECTION_MAX_LENGTH,
-        };
-        let mut tcp_recv = Prebuffered::new(tcp_recv, prebuffer_max_len);
-
-        let mut conn = match mode {
-            ProxyMode::Tcp(destination) => self.create_tunnel(destination).await?,
-            ProxyMode::Http(opts) => {
-                // Read the HTTP header section, but don't remove it from the reader as it should be forwarded too.
-                let (header_len, request) = HttpRequest::peek(&mut tcp_recv)
+    ) -> Result<()> {
+        match mode {
+            ProxyMode::Tcp(destination) => {
+                let (mut tcp_recv, mut tcp_send) = tcp_stream.split();
+                let mut conn = self.create_tunnel(destination).await?;
+                debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "tunnel established");
+                forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
                     .await
-                    .map_err(ProxyError::bad_request)?;
-                debug!(?request, header_len, "read request");
-                match &request {
-                    HttpRequest::Forward(request) => {
-                        let forward = opts.as_forward()?;
-                        let destination = forward.destination(request).await?;
-                        debug!(destination=%destination.fmt_short(), "forwarding proxy request");
-                        self.connect(destination)
-                            .await
-                            .map_err(ProxyError::gateway_timeout)?
-                    }
-                    HttpRequest::Origin(request) => {
-                        let reverse = opts.as_reverse()?;
-                        let destination = reverse.destination(request).await?;
-                        debug!(destination=%destination.fmt_short(), "forwarding origin request");
-                        self.create_tunnel(&destination).await?
-                    }
-                }
+                    .map_err(ProxyError::io)?;
+                Ok(())
             }
-        };
-
-        debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "tunnel established");
-        forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
-            .await
-            .map_err(ProxyError::io)?;
-        Ok(())
+            ProxyMode::Http(opts) => {
+                let io = TokioIo::new(tcp_stream);
+                let service = service_fn(|req| {
+                    let this = self.clone();
+                    let opts = opts.clone();
+                    async move {
+                        let res = match this.handle_hyper_request(src_addr, req, &opts).await {
+                            Ok(res) => res,
+                            Err(err) => {
+                                warn!("Error while forwarding HTTP/2 request: {err:#}");
+                                let status =
+                                    err.response_status().unwrap_or(StatusCode::BAD_GATEWAY);
+                                opts.error_response(status).await
+                            }
+                        };
+                        Ok::<_, Infallible>(res)
+                    }
+                });
+                let mut builder = auto::Builder::new(TokioExecutor::new());
+                builder
+                    .http2()
+                    .initial_stream_window_size(1 << 20)
+                    .initial_connection_window_size(1 << 20)
+                    .max_concurrent_streams(1024);
+                builder.serve_connection_with_upgrades(io, service).await?;
+                Ok(())
+            }
+        }
     }
 
     async fn connect(&self, destination: EndpointId) -> Result<TunnelClientStreams, ProxyError> {
@@ -174,29 +185,97 @@ impl DownstreamProxy {
         let recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
         Ok(TunnelClientStreams { send, recv, conn })
     }
+
+    async fn handle_hyper_request(
+        &self,
+        src_addr: SocketAddr,
+        mut request: Request<Incoming>,
+        opts: &HttpProxyOpts,
+    ) -> Result<Response<HyperBody>, ProxyError> {
+        debug!(?request, "incoming");
+
+        let is_connect = request.method() == Method::CONNECT;
+
+        // Handle upgrade for CONNECT requests over HTTP/1.
+        let upgrade = if is_connect && request.version() < http::Version::HTTP_2 {
+            Some(hyper::upgrade::on(&mut request))
+        } else {
+            None
+        };
+
+        let (parts, body) = request.into_parts();
+        let mut request = HttpRequest::from_parts(parts);
+
+        let destination = opts
+            .request_handler
+            .handle_request(src_addr, &mut request)
+            .await?;
+
+        debug!(destination=%destination.fmt_short(), ?request, "pipe request to upstream");
+
+        // Connect to upstream.
+        let mut conn = self.connect(destination).await?;
+
+        debug!("connected to upstream");
+
+        // Forward the request header section.
+        request.write(&mut conn.send).await?;
+
+        let (response, body) = if is_connect {
+            // For CONNECT requests, we first read the upstream response, and afterwards pipe the body.
+            let response = read_response(&mut conn.recv).await?;
+            debug!(?response, "pipe response to client");
+
+            if !response.status.is_success() {
+                (response, None)
+            } else if let Some(upgrade_fut) = upgrade {
+                spawn(forward_hyper_upgrade(upgrade_fut, conn));
+                (response, None)
+            } else {
+                spawn(forward_hyper_body(body, conn.send));
+                (response, Some(conn.recv))
+            }
+        } else {
+            // For non-CONNECT requests, we pipe the body and read the response concurrently.
+            spawn(forward_hyper_body(body, conn.send));
+            // Read the response from upstream.
+            let response = read_response(&mut conn.recv).await?;
+            (response, Some(conn.recv))
+        };
+
+        debug!(?response, "pipe response to client");
+        response_to_hyper(response, body)
+    }
 }
 
-/// Bidirectional streams for a single iroh tunnel.
+/// Bidirectional QUIC streams for an established tunnel.
+///
+/// Returned by [`DownstreamProxy::create_tunnel`] after a successful CONNECT
+/// handshake with the upstream proxy. Use these streams for bidirectional
+/// data transfer through the tunnel.
 pub struct TunnelClientStreams {
-    /// QUIC send stream toward the upstream proxy.
+    /// Send stream toward the upstream proxy.
     pub send: SendStream,
-    /// QUIC recv stream from the upstream proxy.
+    /// Receive stream from the upstream proxy (with read-ahead buffer).
     pub recv: Prebuffered<RecvStream>,
-    /// Connection handle kept alive for the tunnel lifetime.
+    /// Connection reference that keeps the QUIC connection alive.
     pub conn: ConnectionRef,
 }
 
+/// Routing destination combining an iroh endpoint and target authority.
+///
+/// Specifies both the upstream proxy to connect to (via `endpoint_id`) and
+/// the origin server to reach through that proxy (via `authority`).
 #[derive(Debug, Clone)]
-/// Endpoint identifier paired with the target authority.
 pub struct EndpointAuthority {
-    /// Destination iroh endpoint identifier.
+    /// Iroh endpoint identifier of the upstream proxy.
     pub endpoint_id: EndpointId,
-    /// Target authority for the CONNECT request.
+    /// Target authority for the CONNECT request (host:port).
     pub authority: Authority,
 }
 
 impl EndpointAuthority {
-    /// Constructs an `EndpointAuthority` from its components.
+    /// Creates a new endpoint-authority pair.
     pub fn new(endpoint_id: EndpointId, authority: Authority) -> Self {
         Self {
             endpoint_id,
@@ -204,12 +283,13 @@ impl EndpointAuthority {
         }
     }
 
+    /// Returns a short string representation for logging.
     pub fn fmt_short(&self) -> String {
         format!("{}->{}", self.endpoint_id.fmt_short(), self.authority)
     }
 }
 
-/// Error type for downstream proxy failures.
+/// Error from downstream proxy operations.
 #[stack_error(add_meta, derive)]
 pub struct ProxyError {
     response_status: Option<StatusCode>,
@@ -217,10 +297,10 @@ pub struct ProxyError {
     source: AnyError,
 }
 
-impl From<ExtractError> for ProxyError {
+impl From<Deny> for ProxyError {
     #[track_caller]
-    fn from(value: ExtractError) -> Self {
-        ProxyError::new(Some(value.response_status()), value.into())
+    fn from(value: Deny) -> Self {
+        ProxyError::new(Some(value.code), value.reason)
     }
 }
 
@@ -242,14 +322,6 @@ impl ProxyError {
         self.response_status
     }
 
-    fn to_response(&self) -> Option<HttpResponse> {
-        self.response_status().map(HttpResponse::new)
-    }
-
-    fn bad_request(source: impl Into<AnyError>) -> Self {
-        Self::new(Some(StatusCode::BAD_REQUEST), source.into())
-    }
-
     fn gateway_timeout(source: impl Into<AnyError>) -> Self {
         Self::new(Some(StatusCode::GATEWAY_TIMEOUT), source.into())
     }
@@ -261,4 +333,76 @@ impl ProxyError {
     fn io(source: impl Into<AnyError>) -> Self {
         Self::new(None, source.into())
     }
+}
+
+type HyperBody = BoxBody<Bytes, io::Error>;
+
+fn response_to_hyper(
+    response: HttpResponse,
+    body: Option<Prebuffered<RecvStream>>,
+) -> Result<Response<HyperBody>, ProxyError> {
+    let mut builder = Response::builder().status(response.status);
+    let headers = builder.headers_mut().unwrap();
+    *headers = response.headers;
+    let body = match body {
+        Some(body) => StreamBody::new(recv_to_stream(body).map_ok(Frame::data)).boxed(),
+        None => Empty::new().map_err(infallible_to_io).boxed(),
+    };
+    builder
+        .body(body)
+        .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))
+}
+
+async fn forward_hyper_body(mut body: Incoming, mut send: SendStream) -> Result<()> {
+    while let Some(frame) = body.frame().await {
+        let frame = frame.anyerr()?;
+        // TODO: Add support for trailers.
+        if let Ok(data) = frame.into_data() {
+            send.write_all(&data).await.anyerr()?;
+        }
+    }
+    send.finish().anyerr()?;
+    Ok(())
+}
+
+async fn forward_hyper_upgrade(
+    upgrade_fut: hyper::upgrade::OnUpgrade,
+    mut conn: TunnelClientStreams,
+) -> Result<()> {
+    let upgraded = upgrade_fut.await.std_context("HTTP/1 upgrade failed")?;
+    let upgraded = TokioIo::new(upgraded);
+    // Split the upgraded connection for bidirectional copy
+    let (mut client_read, mut client_write) = tokio::io::split(upgraded);
+    forward_bidi(
+        &mut client_read,
+        &mut client_write,
+        &mut conn.recv,
+        &mut conn.send,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn read_response(recv: &mut Prebuffered<RecvStream>) -> Result<HttpResponse, ProxyError> {
+    HttpResponse::read(recv)
+        .await
+        .map_err(ProxyError::bad_gateway)
+}
+
+fn infallible_to_io(err: Infallible) -> io::Error {
+    match err {}
+}
+
+fn spawn<F, T>(fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    tokio::spawn(
+        async move {
+            if let Err(err) = fut.await {
+                warn!("{err:#}")
+            }
+        }
+        .instrument(tracing::Span::current()),
+    )
 }

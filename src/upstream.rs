@@ -1,5 +1,4 @@
 use std::{
-    io,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -7,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
 use http::StatusCode;
 use iroh::{
     EndpointId,
@@ -15,15 +13,15 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use n0_error::{Result, StackResultExt, StdResultExt};
-use n0_future::stream::{self, StreamExt};
+use n0_future::stream::StreamExt;
 use tokio::net::TcpStream;
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, error_span, instrument, warn};
 
 use crate::{
     HEADER_SECTION_MAX_LENGTH, HttpResponse,
-    parse::{HttpProxyRequestKind, HttpRequest},
-    util::{Prebuffered, forward_bidi},
+    parse::{HttpProxyRequestKind, HttpRequest, filter_hop_by_hop_headers},
+    util::{Prebuffered, forward_bidi, recv_to_stream},
 };
 
 mod auth;
@@ -31,11 +29,33 @@ pub use auth::*;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The `UpstreamProxy` accepts iroh streams and forwards them to upstream TCP destinations.
+/// Proxy that receives iroh streams and forwards them to origin servers.
 ///
-/// It implements [`ProtocolHandler`] and is intended to be mounted onto a [`Router`].
+/// The upstream proxy is the server-side component that accepts connections from
+/// downstream proxies over iroh and forwards requests to actual TCP origin servers.
 ///
-/// [`Router`]: iroh::protocol::Router
+/// # Protocol Support
+///
+/// - **CONNECT tunnels**: Establishes TCP connections to the requested authority
+///   and bidirectionally forwards data.
+/// - **Absolute-form requests**: Forwards HTTP requests to origin servers using
+///   reqwest, with hop-by-hop header filtering per RFC 9110.
+///
+/// # Authorization
+///
+/// All requests pass through an [`AuthHandler`] before processing. Unauthorized
+/// requests receive a 403 Forbidden response.
+///
+/// # Usage
+///
+/// Implements [`ProtocolHandler`] for use with iroh's [`Router`](iroh::protocol::Router):
+///
+/// ```ignore
+/// let proxy = UpstreamProxy::new(AcceptAll)?;
+/// let router = Router::builder(endpoint)
+///     .accept(ALPN, proxy)
+///     .spawn();
+/// ```
 #[derive(derive_more::Debug)]
 pub struct UpstreamProxy {
     #[debug("Arc<dyn AuthHandler>")]
@@ -136,7 +156,7 @@ impl UpstreamProxy {
         let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
         let req = HttpRequest::read(&mut recv).await?;
 
-        debug!(?req, "incoming request");
+        debug!(?req, "handle request");
         let req = req
             .try_into_proxy_request()
             .context("Received origin-form request but expected proxy request")?;
@@ -146,7 +166,8 @@ impl UpstreamProxy {
             Err(reason) => {
                 debug!(?reason, "request is not authorized, abort");
                 HttpResponse::new(StatusCode::FORBIDDEN)
-                    .write(&mut send)
+                    .no_body()
+                    .write(&mut send, true)
                     .await
                     .ok();
                 send.finish().anyerr()?;
@@ -156,11 +177,13 @@ impl UpstreamProxy {
 
         match req.kind {
             HttpProxyRequestKind::Tunnel { target: authority } => {
+                debug!(%authority, "tunnel request: connecting to origin");
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
                         warn!("Failed to connect to origin server: {err:#}");
                         HttpResponse::with_reason(StatusCode::BAD_GATEWAY, "Origin Is Unreachable")
-                            .write(&mut send)
+                            .no_body()
+                            .write(&mut send, true)
                             .await
                             .inspect_err(|err| {
                                 warn!("Failed to write error response to downstream: {err:#}")
@@ -172,35 +195,46 @@ impl UpstreamProxy {
                     Ok(tcp_stream) => {
                         debug!(%authority, "connected to origin");
                         HttpResponse::with_reason(StatusCode::OK, "Connection Established")
-                            .write(&mut send)
+                            .write(&mut send, true)
                             .await
                             .context("Failed to write CONNECT response to downstream")?;
                         let (mut origin_recv, mut origin_send) = tcp_stream.into_split();
-                        forward_bidi(&mut origin_recv, &mut origin_send, &mut recv, &mut send)
-                            .await?;
+                        let (to_origin, from_origin) =
+                            forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send)
+                                .await?;
+                        debug!(to_origin, from_origin, "finish");
                         Ok(())
                     }
                 }
             }
             HttpProxyRequestKind::Absolute { method, target } => {
+                debug!(%target, "origin request: connecting to origin");
                 let body = recv_stream_to_body(recv);
 
+                // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
+                let mut headers = req.headers;
+                filter_hop_by_hop_headers(&mut headers);
+
                 // Forward the request to the upstream server.
-                let res = http_client
+                let mut response = http_client
                     .request(method, target)
-                    // TODO: Filter out hop-to-hop-headers that should not be forwarded to upstream.
-                    .headers(req.headers)
+                    .headers(headers)
                     .body(body)
                     .send()
                     .await
                     .anyerr()?;
-                write_response_header(&res, &mut send).await?;
-                let mut body = res.bytes_stream();
+                filter_hop_by_hop_headers(response.headers_mut());
+                debug!(?response, "received response from origin");
+                write_response_header(&response, &mut send).await?;
+                let mut total = 0;
+                let mut body = response.bytes_stream();
                 while let Some(bytes) = body.next().await {
                     let bytes = bytes.anyerr()?;
+                    total += bytes.len();
                     send.write_chunk(bytes).await.anyerr()?;
                 }
                 send.finish().anyerr()?;
+                debug!(response_body_len=%total, "finish");
                 Ok(())
             }
         }
@@ -209,20 +243,7 @@ impl UpstreamProxy {
 
 // Converts a [`Prebuffered`] recv stream into a streaming [`reqwest::Body`].
 fn recv_stream_to_body(recv: Prebuffered<RecvStream>) -> reqwest::Body {
-    let (init, recv) = recv.into_parts();
-    let body = stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
-        let item: io::Result<Bytes> = if let Some(init) = init.take() {
-            Ok(init)
-        } else {
-            match recv.read_chunk(8192, true).await {
-                Err(err) => Err(err.into()),
-                Ok(None) => return None,
-                Ok(Some(chunk)) => Ok(chunk.bytes),
-            }
-        };
-        Some((item, (None, recv)))
-    });
-    reqwest::Body::wrap_stream(body)
+    reqwest::Body::wrap_stream(recv_to_stream(recv))
 }
 
 async fn write_response_header(res: &reqwest::Response, send: &mut SendStream) -> Result<()> {
@@ -234,7 +255,8 @@ async fn write_response_header(res: &reqwest::Response, send: &mut SendStream) -
         res.status().canonical_reason().unwrap_or_default()
     );
     send.write_all(status_line.as_bytes()).await.anyerr()?;
-    for (name, value) in res.headers() {
+
+    for (name, value) in res.headers().iter() {
         send.write_all(name.as_str().as_bytes()).await.anyerr()?;
         send.write_all(b": ").await.anyerr()?;
         send.write_all(value.as_bytes()).await.anyerr()?;
