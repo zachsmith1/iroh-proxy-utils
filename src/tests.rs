@@ -21,6 +21,7 @@ use crate::{
     IROH_DESTINATION_HEADER,
     downstream::{
         Deny, DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode, RequestHandler,
+        SrcAddr,
         opts::{RequestHandlerChain, StaticForwardProxy, StaticReverseProxy},
     },
     upstream::{AcceptAll, AuthError, AuthHandler, UpstreamProxy},
@@ -190,7 +191,7 @@ struct HeaderResolver;
 impl RequestHandler for HeaderResolver {
     async fn handle_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         let header = req
@@ -202,7 +203,7 @@ impl RequestHandler for HeaderResolver {
             .std_context("invalid iroh-destination header")
             .map_err(Deny::bad_request)?;
         let destination = EndpointId::from_str(header_str).map_err(Deny::bad_request);
-        req.set_forwarded_for(src_addr);
+        req.set_forwarded_for_if_tcp(src_addr);
         destination
     }
 }
@@ -215,7 +216,7 @@ struct SubdomainRouter {
 impl RequestHandler for SubdomainRouter {
     async fn handle_request(
         &self,
-        _src_addr: SocketAddr,
+        _src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         let host = req
@@ -1542,6 +1543,117 @@ async fn test_response_hop_by_hop_headers_filtered() -> Result {
         "Keep-Alive response header was forwarded but shouldn't be"
     );
 
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+// -- UDS tests --
+
+/// Spawns a downstream proxy listening on a Unix Domain Socket.
+#[cfg(unix)]
+async fn spawn_downstream_proxy_uds(
+    mode: ProxyMode,
+) -> Result<(std::path::PathBuf, EndpointId, AbortOnDropHandle<Result>)> {
+    let endpoint = bind_endpoint().await?;
+    let endpoint_id = endpoint.id();
+    let proxy = DownstreamProxy::new(endpoint, Default::default());
+
+    // Create a temp file path for the socket
+    let socket_path = std::env::temp_dir().join(format!("iroh-{}.sock", endpoint_id.fmt_short()));
+    // Remove if it exists from a previous run
+    let _ = std::fs::remove_file(&socket_path);
+
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    debug!(endpoint_id=%endpoint_id.fmt_short(), ?socket_path, "spawned downstream UDS proxy");
+    let task = tokio::spawn(async move { proxy.forward_uds_listener(listener, mode).await });
+    Ok((socket_path, endpoint_id, AbortOnDropHandle::new(task)))
+}
+
+/// HTTP/1.1 reverse proxy through Unix Domain Socket.
+#[cfg(unix)]
+#[tokio::test]
+#[traced_test]
+async fn test_uds_http1_reverse() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
+    let (socket_path, _, proxy_task) = spawn_downstream_proxy_uds(mode).await?;
+
+    // Connect via Unix socket
+    let mut stream = tokio::net::UnixStream::connect(&socket_path).await?;
+
+    // Send HTTP/1.1 request
+    stream
+        .write_all(b"GET /uds/path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await?;
+
+    let (status, body) = read_http_response(&mut stream).await?;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"origin GET /uds/path");
+
+    drop(proxy_task);
+    let _ = std::fs::remove_file(&socket_path);
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// HTTP/2 reverse proxy through Unix Domain Socket.
+#[cfg(unix)]
+#[tokio::test]
+#[traced_test]
+async fn test_uds_http2_reverse() -> Result<()> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
+    let (socket_path, _, proxy_task) = spawn_downstream_proxy_uds(mode).await?;
+
+    // Connect via Unix socket and perform HTTP/2 handshake
+    let stream = tokio::net::UnixStream::connect(&socket_path).await?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .anyerr()?;
+    let conn_task = tokio::spawn(async move { conn.await });
+
+    // Send multiple requests over the HTTP/2 connection
+    let req1 = Request::builder()
+        .method(http::Method::GET)
+        .uri("/uds/h2/path1")
+        .body(Full::new(Bytes::new()))
+        .anyerr()?;
+    let res1 = sender.send_request(req1).await.anyerr()?;
+    assert_eq!(res1.status(), http::StatusCode::OK);
+    let body1 = res1.into_body().collect().await.anyerr()?.to_bytes();
+    assert_eq!(body1.as_ref(), b"origin GET /uds/h2/path1");
+
+    let req2 = Request::builder()
+        .method(http::Method::GET)
+        .uri("/uds/h2/path2")
+        .body(Full::new(Bytes::new()))
+        .anyerr()?;
+    let res2 = sender.send_request(req2).await.anyerr()?;
+    assert_eq!(res2.status(), http::StatusCode::OK);
+    let body2 = res2.into_body().collect().await.anyerr()?.to_bytes();
+    assert_eq!(body2.as_ref(), b"origin GET /uds/h2/path2");
+
+    conn_task.abort();
+    drop(proxy_task);
+    let _ = std::fs::remove_file(&socket_path);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }
