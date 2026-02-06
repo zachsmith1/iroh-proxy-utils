@@ -1,7 +1,7 @@
 use std::{convert::Infallible, fmt::Debug, io, net::SocketAddr};
 
 use bytes::Bytes;
-use http::{Method, StatusCode};
+use http::{Method, StatusCode, Version, header};
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
 use hyper::{
     Request, Response,
@@ -165,7 +165,8 @@ impl DownstreamProxy {
                     .http2()
                     .initial_stream_window_size(1 << 20)
                     .initial_connection_window_size(1 << 20)
-                    .max_concurrent_streams(1024);
+                    .max_concurrent_streams(1024)
+                    .enable_connect_protocol();
                 builder.serve_connection_with_upgrades(io, service).await?;
                 Ok(())
             }
@@ -194,10 +195,10 @@ impl DownstreamProxy {
     ) -> Result<Response<HyperBody>, ProxyError> {
         debug!(?request, "incoming");
 
+        let is_upgrade = request.headers().contains_key(header::UPGRADE);
         let is_connect = request.method() == Method::CONNECT;
-
-        // Handle upgrade for CONNECT requests over HTTP/1.
-        let upgrade = if is_connect && request.version() < http::Version::HTTP_2 {
+        let is_h2_extended_connect = convert_h2_extended_connect_to_upgrade(&mut request);
+        let upgrade = if is_connect || is_upgrade {
             Some(hyper::upgrade::on(&mut request))
         } else {
             None
@@ -211,40 +212,74 @@ impl DownstreamProxy {
             .handle_request(src_addr, &mut request)
             .await?;
 
-        debug!(destination=%destination.fmt_short(), ?request, "pipe request to upstream");
+        // We always forward as HTTP/1.1.
+        request.version = Version::HTTP_11;
+
+        // Now we shouldn't mutate the request anymore.
+        let request = request;
+
+        debug!(destination=%destination.fmt_short(), ?request, is_connect, is_h2_extended_connect, is_upgrade, "pipe request to upstream");
 
         // Connect to upstream.
         let mut conn = self.connect(destination).await?;
-
         debug!("connected to upstream");
 
         // Forward the request header section.
         request.write(&mut conn.send).await?;
 
-        let (response, body) = if is_connect {
-            // For CONNECT requests, we first read the upstream response, and afterwards pipe the body.
-            let response = read_response(&mut conn.recv).await?;
-            debug!(?response, "pipe response to client");
+        if let Some(upgrade_fut) = upgrade {
+            let mut response = read_response(&mut conn.recv).await?;
+            debug!(?response, "read connect response");
 
-            if !response.status.is_success() {
-                (response, None)
-            } else if let Some(upgrade_fut) = upgrade {
+            if is_h2_extended_connect && response.status == StatusCode::SWITCHING_PROTOCOLS {
+                response.status = StatusCode::OK;
+                response.headers.remove(header::UPGRADE);
+                response.headers.remove(header::CONNECTION);
+            }
+
+            let is_ok = is_connect && response.status == StatusCode::OK
+                || is_upgrade && response.status == StatusCode::SWITCHING_PROTOCOLS;
+
+            if is_ok {
                 spawn(forward_hyper_upgrade(upgrade_fut, conn));
-                (response, None)
+                response_to_hyper(response, None)
+            } else if request.method == Method::CONNECT {
+                response_to_hyper(response, None)
             } else {
-                spawn(forward_hyper_body(body, conn.send));
-                (response, Some(conn.recv))
+                spawn(forward_hyper_body_and_finish(body, conn.send));
+                response_to_hyper(response, Some(conn.recv))
             }
         } else {
-            // For non-CONNECT requests, we pipe the body and read the response concurrently.
-            spawn(forward_hyper_body(body, conn.send));
-            // Read the response from upstream.
+            // For regular non-CONNECT requests, pipe body and read response concurrently.
+            spawn(forward_hyper_body_and_finish(body, conn.send));
             let response = read_response(&mut conn.recv).await?;
-            (response, Some(conn.recv))
-        };
+            response_to_hyper(response, Some(conn.recv))
+        }
+    }
+}
 
-        debug!(?response, "pipe response to client");
-        response_to_hyper(response, body)
+fn convert_h2_extended_connect_to_upgrade(request: &mut Request<Incoming>) -> bool {
+    if request.version() != Version::HTTP_2 {
+        return false;
+    }
+    // Handle HTTP/2 extended CONNECT (RFC 8441) - convert to upgrade-style request.
+    // Extended CONNECT uses :protocol pseudo-header instead of Upgrade header.
+    let extended_connect_protocol = request
+        .extensions()
+        .get::<hyper::ext::Protocol>()
+        .map(|p| p.as_str().to_string());
+    if let Some(protocol) = extended_connect_protocol {
+        debug!(%protocol, "extended CONNECT request, converting to upgrade request");
+        *request.method_mut() = Method::GET;
+        request
+            .headers_mut()
+            .insert(header::UPGRADE, protocol.parse().unwrap());
+        request
+            .headers_mut()
+            .insert(header::CONNECTION, "upgrade".parse().unwrap());
+        true
+    } else {
+        false
     }
 }
 
@@ -353,7 +388,15 @@ fn response_to_hyper(
         .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))
 }
 
-async fn forward_hyper_body(mut body: Incoming, mut send: SendStream) -> Result<()> {
+async fn forward_hyper_body_and_finish(body: Incoming, mut send: SendStream) -> Result<()> {
+    forward_hyper_body(body, &mut send).await?;
+    send.finish().anyerr()?;
+    Ok(())
+}
+
+/// Forwards hyper body to send stream without finishing.
+/// Used for upgrade requests where we may need to continue using the stream.
+async fn forward_hyper_body(mut body: Incoming, send: &mut SendStream) -> Result<()> {
     while let Some(frame) = body.frame().await {
         let frame = frame.anyerr()?;
         // TODO: Add support for trailers.
@@ -361,7 +404,6 @@ async fn forward_hyper_body(mut body: Incoming, mut send: SendStream) -> Result<
             send.write_all(&data).await.anyerr()?;
         }
     }
-    send.finish().anyerr()?;
     Ok(())
 }
 
